@@ -1,0 +1,6 @@
+streamlit
+openai
+ebooklib
+requests
+beautifulsoup4
+Pillow
