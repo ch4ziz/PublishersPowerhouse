@@ -1,14 +1,14 @@
 import streamlit as st
 import requests
-import pandas as pd # Not strictly needed for this version, but often useful
 import openai
 from ebooklib import epub
-from io import BytesIO # To handle image data in memory
-from PIL import Image, ImageDraw, ImageFont # For fallback cover image generation
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 import logging
 import json
 import time
 from typing import List
+from datetime import datetime # Added for unique EPUB ID
 
 # -------------------------------
 # Configuration & API Keys Setup
@@ -19,10 +19,14 @@ logger = logging.getLogger(__name__)
 
 # Set OpenAI API key from Streamlit secrets
 try:
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
+    api_key = st.secrets["OPENAI_API_KEY"]
 except KeyError:
     st.error("OpenAI API key not found in Streamlit Secrets. Please add it to run this app.")
     st.stop() # Stop execution if API key is missing
+
+# Initialize OpenAI client in session state to avoid re-initialization on every rerun
+if "openai_client" not in st.session_state:
+    st.session_state.openai_client = openai.OpenAI(api_key=api_key)
 
 # -------------------------------
 # Streamlit Page Configuration
@@ -36,7 +40,7 @@ st.markdown(
     detailed chapters, and a custom cover image, compiled into an EPUB file.
 
     > **Disclaimer**: AI-generated content may contain inaccuracies. Please review and edit the generated book.
-    > Using DALL-E and GPT-4 incurs costs on your OpenAI account.
+    > Using DALL-E and GPT-4o incurs costs on your OpenAI account.
     """
 )
 
@@ -46,56 +50,61 @@ st.markdown(
 
 def call_openai_chat_api(prompt: str, model: str = "gpt-4o", max_tokens: int = 1500, temperature: float = 0.7) -> str:
     """
-    Calls the OpenAI ChatCompletion API and returns the response text.
+    Calls the OpenAI ChatCompletion API (v1.x.x syntax) and returns the response text.
     """
     try:
-        response = openai.ChatCompletion.create(
+        response = st.session_state.openai_client.chat.completions.create( # Updated syntax
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             n=1,
             temperature=temperature,
         )
-        result = response.choices[0].message['content'].strip()
+        result = response.choices[0].message.content.strip() # Accessing content changed
         logger.debug("Received response from OpenAI Chat API")
         return result
-    except openai.error.AuthenticationError:
-        st.error("OpenAI API Key is invalid or expired. Please update it in Streamlit Secrets.")
-        st.stop()
-    except openai.error.APIError as e:
-        logger.error(f"OpenAI API error: {e}")
-        st.error(f"OpenAI API Error: {e}. Please try again later.")
-        st.stop()
+    except openai.APIStatusError as e: # Catch all API errors
+        if e.status_code == 401:
+            st.error("OpenAI API Key is invalid or expired. Please update it in Streamlit Secrets.")
+            st.stop()
+        else:
+            logger.error(f"OpenAI API error: {e}")
+            st.error(f"OpenAI API Error (Status {e.status_code}): {e.response}. Please try again later.")
+            st.stop()
     except Exception as e:
-        logger.error(f"Error calling OpenAI API: {e}")
-        st.error(f"An unexpected error occurred with the OpenAI API: {e}")
+        logger.error(f"An unexpected error occurred with the OpenAI Chat API: {e}")
+        st.error(f"An unexpected error occurred with the OpenAI Chat API: {e}")
         st.stop()
 
 def call_openai_image_api(prompt: str, size: str = "1024x1024", quality: str = "standard") -> BytesIO:
     """
-    Calls the OpenAI Image (DALL-E) API and returns the image data as BytesIO.
+    Calls the OpenAI Image (DALL-E) API (v1.x.x syntax) and returns the image data as BytesIO.
     """
     try:
-        response = openai.Image.create(
+        response = st.session_state.openai_client.images.generate( # Updated syntax
             model="dall-e-3",
             prompt=prompt,
             size=size,
             quality=quality,
             n=1
         )
-        image_url = response.data[0].url
+        image_url = response.data[0].url # Accessing URL changed
         logger.info(f"Generated DALL-E image URL: {image_url}")
         
         img_data = requests.get(image_url).content
         return BytesIO(img_data)
-    except openai.error.OpenAIError as e:
-        logger.error(f"DALL-E API error: {e}")
-        st.error(f"Could not generate cover image using DALL-E: {e}. Try adjusting the topic or using a simpler one.")
-        raise
+    except openai.APIStatusError as e: # Catch all API errors
+        if e.status_code == 401:
+            st.error("OpenAI API Key is invalid or expired. Please update it in Streamlit Secrets.")
+            st.stop()
+        else:
+            logger.error(f"DALL-E API error: {e}")
+            st.error(f"Could not generate cover image using DALL-E (Status {e.status_code}): {e.response}. Try adjusting the topic or using a simpler one.")
+            raise # Re-raise to trigger the fallback
     except Exception as e:
-        logger.error(f"Error fetching DALL-E image: {e}")
+        logger.error(f"An unexpected error occurred while fetching the DALL-E image: {e}")
         st.error(f"An unexpected error occurred while fetching the DALL-E image: {e}")
-        raise
+        raise # Re-raise to trigger the fallback
 
 # -------------------------------
 # Book Generation Functions
@@ -176,7 +185,7 @@ def generate_cover_image_data(topic: str) -> BytesIO:
             image_data = call_openai_image_api(cover_prompt, size="1024x1024", quality="hd")
             st.success("Cover image generated by DALL-E!")
             return image_data
-    except Exception as e:
+    except Exception as e: # Catch exceptions from call_openai_image_api (which re-raises)
         logger.error(f"Failed to generate DALL-E cover: {e}. Falling back to placeholder.")
         st.warning("Failed to generate AI cover image. Creating a simple placeholder cover.")
         # Fallback to PIL-generated placeholder
@@ -186,19 +195,22 @@ def generate_cover_image_data(topic: str) -> BytesIO:
         
         try:
             # Try to use a common font or default to a generic one
-            font_path = "arial.ttf" # Common font on Windows
-            if sys.platform == "darwin": # Mac
-                font_path = "/Library/Fonts/Arial.ttf"
-            # Fallback for Linux or if Arial not found
-            font = ImageFont.truetype(font_path, 40)
+            # Streamlit environment might not have specific fonts. A safer bet is to use default or
+            # package a font with your app, but for a basic fallback, default is fine.
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40) # Common Linux font path
         except IOError:
             font = ImageFont.load_default() # Load default PIL font
 
         text = f"Book Cover\n'{topic}'"
         # Calculate text size and position
-        text_bbox = d.textbbox((0,0), text, font=font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
+        # Use textlength for newer Pillow, textbbox for older
+        try:
+            text_width = d.textlength(text, font=font)
+            text_height = font.getbbox(text)[3] - font.getbbox(text)[1] # More accurate height for multiline
+        except AttributeError: # Fallback for older Pillow versions without textlength
+            text_bbox = d.textbbox((0,0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
         
         x = (img_size[0] - text_width) / 2
         y = (img_size[1] - text_height) / 2
@@ -226,7 +238,11 @@ def compile_book_to_epub(title: str, author: str, content: str, cover_image_data
         
         # Add a cover image item
         cover_image_filename = "cover.png" # Standard filename for EPUB cover
+        # Ensure the buffer is at the beginning before reading content
+        cover_image_data.seek(0)
         book.add_item(epub.EpubItem(uid="cover_image", file_name=cover_image_filename, media_type="image/png", content=cover_image_data.read()))
+        # Reset buffer for set_cover if it reads again
+        cover_image_data.seek(0)
         book.set_cover(cover_image_filename, cover_image_data.read()) # Set cover in EPUB metadata
 
         # Create the main content chapter
