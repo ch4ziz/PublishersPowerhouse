@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFont # For fallback cover image generatio
 import logging
 import json
 import time
+from typing import List
 
 # -------------------------------
 # Configuration & API Keys Setup
