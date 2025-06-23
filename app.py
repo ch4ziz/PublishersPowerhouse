@@ -121,6 +121,12 @@ def generate_book_outline(topic: str, num_chapters: int) -> List[str]:
     )
     outline_response = call_openai_chat_api(outline_prompt, max_tokens=num_chapters * 30, model="gpt-4o") # Adjust max_tokens based on num_chapters
     
+    # --- NEW FIX START ---
+    # Strip markdown code block wrappers if they exist
+    if outline_response.startswith("```json"):
+        outline_response = outline_response.strip().removeprefix("```json").removesuffix("```")
+    # --- NEW FIX END ---
+
     try:
         chapters = json.loads(outline_response)
         if not isinstance(chapters, list):
